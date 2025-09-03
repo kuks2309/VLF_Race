@@ -1,0 +1,51 @@
+# Compiled Object files
+*.o
+*.obj
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Libraries
+*.lib
+*.a
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Arduino build files
+build/
+*.hex
+*.elf
+*.eep
+*.map
+
+# IDE files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# VS Code workspace settings (keep project settings)
+.vscode/settings.json
+.vscode/launch.json
+.vscode/tasks.json
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Backup files
+*.bak
+*.backup
+
+# OS generated files
+.DS_Store?
+ehthumbs.db
+Icon?

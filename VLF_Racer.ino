@@ -20,6 +20,8 @@
 // Servo control
 #define SERVO_PIN 8
 #define STRAIGHT_ANGLE 87
+#define MAX_LEFT_Steering_Angle   -30
+#define MAX_RIGHT_Steering_Angle   30
 
 #define FASTADC 1 // ADC 속도 빠르게 설정
 
@@ -58,13 +60,17 @@ volatile bool cameraTaskRunning = true; // 현재 카메라 태스크 상태
 
 // 조향 제어 변수
 volatile float steering_angle = 0.0;    // 계산된 조향 각도
+volatile float vision_steer_angle = 0.0; // 비전 기반 조향 각도
 volatile int mission_flag = 0;          // 미션 상태 플래그
 
 byte Pixel[NPIXELS];          // 원본 픽셀 데이터
 byte PixelBuffer[NPIXELS];    // 전송용 버퍼
 byte threshold_data[NPIXELS]; // 임계값 처리된 데이터
 
-// 카메라 제어 함수들
+//====================================================================
+// CAMERA CONTROL FUNCTIONS
+//====================================================================
+
 void Enable_Camera()
 {
     if (xCameraTaskHandle != NULL && !cameraTaskRunning)
@@ -160,6 +166,10 @@ void send_pixel_data()
     Serial.println();
 }
 
+//====================================================================
+// MOTOR CONTROL FUNCTIONS
+//====================================================================
+
 void motor_control(int8_t direction, uint8_t motor_speed)
 {
     if (direction == 1)
@@ -190,7 +200,10 @@ float calculate_yaw_angle_y_axis(float d)
     return yaw_degree;
 }
 
-/////////////////////////////////////// ENCODER ////////////////////////
+//====================================================================
+// ENCODER FUNCTIONS
+//====================================================================
+
 volatile long encoderPos = 0;
 
 void encoderB()
@@ -213,6 +226,21 @@ void interrupt_setup(void)
   TCCR1B = TCCR1B & 0b11111000 | 1;         // To prevent Motor Noise
 }
 
+
+void Steering_Control(float s_angle)
+{
+  if(s_angle <= MAX_LEFT_Steering_Angle) 
+  {
+    s_angle = MAX_LEFT_Steering_Angle;
+  }
+
+  if(s_angle >= MAX_RIGHT_Steering_Angle) 
+  {
+    s_angle = MAX_RIGHT_Steering_Angle;
+  }
+
+  myServo.write(STRAIGHT_ANGLE + s_angle);
+}
 
 // 임계값 설정 (setup 내에서 static으로 선언하여 메모리에 유지)
 static int cameraThreshold = 128; // 기본값 128, 필요에 따라 변경 가능
@@ -292,7 +320,10 @@ void setup()
     }
 }
 
-// 카메라 읽기 태스크
+//====================================================================
+// FREERTOS TASK FUNCTIONS
+//====================================================================
+
 void TaskCamera(void *pvParameters)
 {
     // pvParameters로 전달받은 threshold 값 추출
@@ -321,7 +352,9 @@ void TaskCamera(void *pvParameters)
         // 255: 모든 픽셀이 그대로 (임계값 무시)
         line_threshold(threshold); // 전달받은 threshold 값 사용
 
-        find_line_center();
+        float d = find_line_center();
+        vision_steer_angle = calculate_yaw_angle_y_axis(d);
+
         // 정확한 25Hz 주기 유지
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
@@ -386,6 +419,8 @@ void TaskControl(void *pvParameters)
                 break;
             case 1:
                 // lane_control 미션 로직
+                motor_control(true, 200);
+                Steering_Control(vision_steer_angle);
                 break;
             case 2:
                 // wall_following 미션 로직
