@@ -9,7 +9,8 @@
 #define TSL1401_SI 10  // TSL1401 SI 핀
 #define TSL1401_AO A0  // TSL1401 아날로그 출력 핀
 #define NPIXELS 128    // 총 픽셀 수
-#define Camera_calibration 0.8
+#define Camera_calibration 2.1  // 펙셀을 mm로 바꾸는 계수
+#define H 250.0 // 카메라와 바퀴축 사이 거리 mm
 
 // Motor Control
 #define MOTOR_DIR_PIN 4
@@ -52,15 +53,17 @@ void TaskControl(void *pvParameters);
 Servo myServo;
 
 // H 값 정의 (calculate_yaw_angle_y_axis 함수에서 사용)
-#define H 10.0 // 카메라와 바퀴축 사이 거리
 
-// 카메라 제어 플래그
+
+// 태스크 제어 플래그
 volatile bool enableCamera = true;      // true: 카메라 실행, false: 카메라 정지
 volatile bool cameraTaskRunning = true; // 현재 카메라 태스크 상태
+volatile bool serialTaskRunning = true; // 현재 시리얼 태스크 상태
 
 // 조향 제어 변수
 volatile float steering_angle = 0.0;    // 계산된 조향 각도
 volatile float vision_steer_angle = 0.0; // 비전 기반 조향 각도
+volatile float line_center_pos = NPIXELS / 2.0; // 라인 중심 위치 (무게 중심)
 volatile int mission_flag = 0;          // 미션 상태 플래그
 
 byte Pixel[NPIXELS];          // 원본 픽셀 데이터
@@ -96,6 +99,38 @@ void Disable_Camera()
         if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
         {
             Serial.println("Camera task disabled");
+            xSemaphoreGive(xSerialSemaphore);
+        }
+    }
+}
+
+// 시리얼 태스크 제어 함수
+void Enable_Serial()
+{
+    if (xSerialTaskHandle != NULL && !serialTaskRunning)
+    {
+        vTaskResume(xSerialTaskHandle);
+        serialTaskRunning = true;
+
+        if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            Serial.println("Serial task enabled");
+            xSemaphoreGive(xSerialSemaphore);
+        }
+    }
+}
+
+void Disable_Serial()
+{
+    if (xSerialTaskHandle != NULL && serialTaskRunning)
+    {
+        vTaskSuspend(xSerialTaskHandle);
+        serialTaskRunning = false;
+        
+        // 시리얼 태스크가 비활성화되면 마지막 메시지 출력
+        if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            Serial.println("Serial task disabled");
             xSemaphoreGive(xSerialSemaphore);
         }
     }
@@ -185,17 +220,32 @@ void motor_control(int8_t direction, uint8_t motor_speed)
 
 float calculate_yaw_angle_y_axis(float d)
 {
-    // H²-d² 계산
+    // 1. 먼저 부호를 저장
+    float sign = (d < 0) ? -1.0 : 1.0;
+    
+    // 2. d를 양수로 변환하여 계산
+    float positive_d = abs(d);
+    
+    // H²-d² 계산 (양수 값 사용)
     float H_squared = H * H;
-    float d_squared = d * d;
-    float x_component = H_squared - d_squared; // atan2의 x 성분 (y축 기준이므로)
-    float y_component = 2.0 * d * H;           // atan2의 y 성분
+    float d_squared = positive_d * positive_d;
+    
+    // d²이 H²보다 크면 범위 제한
+    if (d_squared > H_squared) {
+        d_squared = H_squared * 0.99;  // 최대값의 99%로 제한
+    }
+    
+    float x_component = H_squared - d_squared; // atan2의 x 성분
+    float y_component = 2.0 * positive_d * H;  // atan2의 y 성분
 
     // y축 기준 atan2 계산 (라디안)
     float yaw_rad = atan2(y_component, x_component);
 
     // 라디안을 degree로 변환
     float yaw_degree = yaw_rad * 180.0 / M_PI;
+    
+    // 3. 마지막에 부호 적용
+    yaw_degree = yaw_degree * sign;
 
     return yaw_degree;
 }
@@ -239,11 +289,11 @@ void Steering_Control(float s_angle)
     s_angle = MAX_RIGHT_Steering_Angle;
   }
 
-  myServo.write(STRAIGHT_ANGLE + s_angle);
+  myServo.write(STRAIGHT_ANGLE + s_angle); // 부호만 바꿀 것
 }
 
 // 임계값 설정 (setup 내에서 static으로 선언하여 메모리에 유지)
-static int cameraThreshold = 128; // 기본값 128, 필요에 따라 변경 가능
+static int cameraThreshold = 70; // 기본값 128, 필요에 따라 변경 가능
 
 void setup()
 {
@@ -251,6 +301,13 @@ void setup()
     wdt_disable();
 
     Serial.begin(115200);
+    #if defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__) || defined(__AVR_ATmega32U4__)
+    Serial1.begin(115200);  // Serial1 디버깅용 (Mega, Leonardo 등)
+    Serial1.println("Serial1 Debug Started at 115200 baud");
+    Serial.println("Serial1 initialized for debugging");
+    #else
+    Serial.println("Serial1 not available on this board");
+    #endif
     while (!Serial)
     {
         ; // 시리얼 포트가 연결될 때까지 대기
@@ -352,7 +409,18 @@ void TaskCamera(void *pvParameters)
         // 255: 모든 픽셀이 그대로 (임계값 무시)
         line_threshold(threshold); // 전달받은 threshold 값 사용
 
-        float d = find_line_center();
+        float center = find_line_center();
+        
+        // 데이터 세마포어로 보호하여 라인 중심 위치 저장
+        if (xSemaphoreTake(xSteeringSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            line_center_pos = center;
+            xSemaphoreGive(xSteeringSemaphore);
+        }
+        
+        // 중심(64)에서부터의 오프셋 계산 (-64 ~ +64)
+        float pixel_offset = center - (NPIXELS / 2.0);
+        float d = pixel_offset * Camera_calibration;
         vision_steer_angle = calculate_yaw_angle_y_axis(d);
 
         // 정확한 25Hz 주기 유지
@@ -367,7 +435,7 @@ void TaskSerial(void *pvParameters)
 {
     (void) pvParameters;
 
-    const TickType_t xDelay = pdMS_TO_TICKS(100); // 100ms 간격으로 데이터 전송
+    const TickType_t xDelay = pdMS_TO_TICKS(200); // 200ms 간격으로 데이터 전송 (초당 5회)
     TickType_t xLastWakeTime = xTaskGetTickCount();
     byte localPixelBuffer[NPIXELS]; // 로컬 버퍼
 
@@ -385,17 +453,40 @@ void TaskSerial(void *pvParameters)
             // 시리얼로 데이터 전송 (Serial 0번 사용)
             if (xSemaphoreTake(xSerialSemaphore, portMAX_DELAY) == pdTRUE)
             {
+                // 128개 픽셀 데이터 전송
                 for (int i = 0; i < NPIXELS; i++)
                 {
                     Serial.print(localPixelBuffer[i]);
                     Serial.print(",");
                 }
+                
+                // 라인 중심 위치 값 추가 (129번째 값)
+                float center_value = line_center_pos;
+                float current_steer_angle = vision_steer_angle;
+                if (xSemaphoreTake(xSteeringSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+                {
+                    center_value = line_center_pos;
+                    current_steer_angle = vision_steer_angle;
+                    xSemaphoreGive(xSteeringSemaphore);
+                }
+                Serial.print(center_value);
                 Serial.println();
+                
+                // Serial1로 디버깅 정보 출력 (Mega, Leonardo 등에서만)
+                #if defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__) || defined(__AVR_ATmega32U4__)
+                Serial1.print("LC:");
+                Serial1.print(center_value, 1);
+                Serial1.print(",SA:");
+                Serial1.print(current_steer_angle, 1);
+                Serial1.print(",MF:");
+                Serial1.println(mission_flag);
+                #endif
+                
                 xSemaphoreGive(xSerialSemaphore);
             }
         }
 
-        // 정확한 100ms 주기 유지
+        // 정확한 200ms 주기 유지
         vTaskDelayUntil(&xLastWakeTime, xDelay);
     }
 }
@@ -421,6 +512,19 @@ void TaskControl(void *pvParameters)
                 // lane_control 미션 로직
                 motor_control(true, 200);
                 Steering_Control(vision_steer_angle);
+                
+                // Serial1로 제어 상태 출력
+                #if defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__) || defined(__AVR_ATmega32U4__)
+                static unsigned long lastDebugTime = 0;
+                unsigned long currentTime = millis();
+                if (currentTime - lastDebugTime >= 200) {  // 200ms마다 출력
+                    lastDebugTime = currentTime;
+                    Serial1.print("Control: Steer=");
+                    Serial1.print(vision_steer_angle, 1);
+                    Serial1.print(", Servo=");
+                    Serial1.println(STRAIGHT_ANGLE + vision_steer_angle);
+                }
+                #endif
                 break;
             case 2:
                 // wall_following 미션 로직
@@ -444,10 +548,17 @@ void TaskControl(void *pvParameters)
 
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
+
+
+    //Enable_Camera();
+    //Enable_Serial();
+    //Disable_Serial();
 }
 
 void loop()
 {
-    Enable_Camera();
+    // 테스트를 위해 mission_flag를 1로 설정하여 모터 제어 활성화
+    mission_flag = 1;
+    Enable_Serial();
     vTaskDelay(pdMS_TO_TICKS(10));
 }
