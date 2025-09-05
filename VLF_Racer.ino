@@ -66,6 +66,11 @@ volatile float vision_steer_angle = 0.0; // 비전 기반 조향 각도
 volatile float line_center_pos = NPIXELS / 2.0; // 라인 중심 위치 (무게 중심)
 volatile int mission_flag = 0;          // 미션 상태 플래그
 
+// PD 제어 변수
+float Kp = 1.5;  // 비례 게인 (라인 중심 오차에 대한 반응)
+float Kd = 0.8;  // 미분 게인 (오차 변화율에 대한 반응)
+float previous_error = 0.0;  // 이전 오차값 저장
+
 byte Pixel[NPIXELS];          // 원본 픽셀 데이터
 byte PixelBuffer[NPIXELS];    // 전송용 버퍼
 byte threshold_data[NPIXELS]; // 임계값 처리된 데이터
@@ -218,36 +223,31 @@ void motor_control(int8_t direction, uint8_t motor_speed)
     analogWrite(MOTOR_PWM_PIN, motor_speed);
 }
 
-float calculate_yaw_angle_y_axis(float d)
+// PD 제어 함수 - 라인 중심 오차를 기반으로 조향각 계산
+float calculate_pd_steering(float line_center)
 {
-    // 1. 먼저 부호를 저장
-    float sign = (d < 0) ? -1.0 : 1.0;
+    // 오차 계산: 중심(64)에서 벗어난 정도
+    // 오차가 양수면 라인이 오른쪽에 있음 -> 오른쪽으로 조향
+    // 오차가 음수면 라인이 왼쪽에 있음 -> 왼쪽으로 조향
+    float error = line_center - (NPIXELS / 2.0);  // 64픽셀이 중심
     
-    // 2. d를 양수로 변환하여 계산
-    float positive_d = abs(d);
+    // 미분항 계산 (오차 변화율)
+    float derivative = error - previous_error;
     
-    // H²-d² 계산 (양수 값 사용)
-    float H_squared = H * H;
-    float d_squared = positive_d * positive_d;
+    // PD 제어 출력 계산
+    float steering_output = (Kp * error) + (Kd * derivative);
     
-    // d²이 H²보다 크면 범위 제한
-    if (d_squared > H_squared) {
-        d_squared = H_squared * 0.99;  // 최대값의 99%로 제한
+    // 이전 오차값 업데이트
+    previous_error = error;
+    
+    // 조향각 제한 (-30 ~ +30도)
+    if (steering_output > 30.0) {
+        steering_output = 30.0;
+    } else if (steering_output < -30.0) {
+        steering_output = -30.0;
     }
     
-    float x_component = H_squared - d_squared; // atan2의 x 성분
-    float y_component = 2.0 * positive_d * H;  // atan2의 y 성분
-
-    // y축 기준 atan2 계산 (라디안)
-    float yaw_rad = atan2(y_component, x_component);
-
-    // 라디안을 degree로 변환
-    float yaw_degree = yaw_rad * 180.0 / M_PI;
-    
-    // 3. 마지막에 부호 적용
-    yaw_degree = yaw_degree * sign;
-
-    return yaw_degree;
+    return steering_output;
 }
 
 //====================================================================
@@ -418,10 +418,8 @@ void TaskCamera(void *pvParameters)
             xSemaphoreGive(xSteeringSemaphore);
         }
         
-        // 중심(64)에서부터의 오프셋 계산 (-64 ~ +64)
-        float pixel_offset = center - (NPIXELS / 2.0);
-        float d = pixel_offset * Camera_calibration;
-        vision_steer_angle = calculate_yaw_angle_y_axis(d);
+        // PD 제어를 사용하여 조향각 계산
+        vision_steer_angle = calculate_pd_steering(center);
 
         // 정확한 25Hz 주기 유지
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -479,7 +477,9 @@ void TaskSerial(void *pvParameters)
                 Serial1.print(",SA:");
                 Serial1.print(current_steer_angle, 1);
                 Serial1.print(",MF:");
-                Serial1.println(mission_flag);
+                Serial1.print(mission_flag);
+                Serial1.print(",Servo:");
+                Serial1.println(STRAIGHT_ANGLE + current_steer_angle);
                 #endif
                 
                 xSemaphoreGive(xSerialSemaphore);
@@ -513,18 +513,7 @@ void TaskControl(void *pvParameters)
                 motor_control(true, 200);
                 Steering_Control(vision_steer_angle);
                 
-                // Serial1로 제어 상태 출력
-                #if defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__) || defined(__AVR_ATmega32U4__)
-                static unsigned long lastDebugTime = 0;
-                unsigned long currentTime = millis();
-                if (currentTime - lastDebugTime >= 200) {  // 200ms마다 출력
-                    lastDebugTime = currentTime;
-                    Serial1.print("Control: Steer=");
-                    Serial1.print(vision_steer_angle, 1);
-                    Serial1.print(", Servo=");
-                    Serial1.println(STRAIGHT_ANGLE + vision_steer_angle);
-                }
-                #endif
+                // 제어 상태는 Serial Task에서 출력됨
                 break;
             case 2:
                 // wall_following 미션 로직
