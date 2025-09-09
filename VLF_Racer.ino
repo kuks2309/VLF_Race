@@ -3,10 +3,11 @@
 #include <avr/io.h>  // AVR 레지스터 정의 포함
 #include <avr/wdt.h> // Watchdog Timer 헤더
 #include <semphr.h>
+#include <NewPing.h> // NewPing 라이브러리
 
 // Camera Control
-#define TSL1401_CLK 11 // TSL1401 클럭 핀
-#define TSL1401_SI 10  // TSL1401 SI 핀
+#define TSL1401_CLK 12 // TSL1401 클럭 핀
+#define TSL1401_SI 13  // TSL1401 SI 핀
 #define TSL1401_AO A0  // TSL1401 아날로그 출력 핀
 #define NPIXELS 128    // 총 픽셀 수
 #define Camera_calibration 2.1  // 펙셀을 mm로 바꾸는 계수
@@ -19,10 +20,15 @@
 #define encodPinB1   3
 
 // Servo control
-#define SERVO_PIN 8
+#define SERVO_PIN 22
 #define STRAIGHT_ANGLE 87
 #define MAX_LEFT_Steering_Angle   -30
 #define MAX_RIGHT_Steering_Angle   30
+
+// Ultrasonic Sensor
+#define TRIG_PIN 9
+#define ECHO_PIN 8
+#define MAX_DISTANCE 400 // 최대 측정 거리 (cm)
 
 #define FASTADC 1 // ADC 속도 빠르게 설정
 
@@ -38,19 +44,25 @@
 SemaphoreHandle_t xSerialSemaphore;
 SemaphoreHandle_t xDataSemaphore; // 픽셀 데이터 보호용
 SemaphoreHandle_t xSteeringSemaphore; // 조향 데이터 보호용
+SemaphoreHandle_t xUltrasonicSemaphore; // 초음파 센서 데이터 보호용
 
 // 태스크 핸들 선언
 TaskHandle_t xCameraTaskHandle = NULL;
 TaskHandle_t xSerialTaskHandle = NULL;
 TaskHandle_t xControlTaskHandle = NULL;
+TaskHandle_t xUltrasonicTaskHandle = NULL;
 
 // 태스크 함수 선언
 void TaskSerial(void *pvParameters);
 void TaskCamera(void *pvParameters);
 void TaskControl(void *pvParameters);
+void TaskUltrasonic(void *pvParameters);
 
 // Servo 객체
 Servo myServo;
+
+// NewPing 객체
+NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DISTANCE);
 
 // H 값 정의 (calculate_yaw_angle_y_axis 함수에서 사용)
 
@@ -67,9 +79,12 @@ volatile float line_center_pos = NPIXELS / 2.0; // 라인 중심 위치 (무게 
 volatile int mission_flag = 0;          // 미션 상태 플래그
 
 // PD 제어 변수
-float Kp = 1.5;  // 비례 게인 (라인 중심 오차에 대한 반응)
-float Kd = 0.8;  // 미분 게인 (오차 변화율에 대한 반응)
+float Kp = 0.42;  // 비례 게인 (라인 중심 오차에 대한 반응)
+float Kd = 1.5;  // 미분 게인 (오차 변화율에 대한 반응)
 float previous_error = 0.0;  // 이전 오차값 저장
+
+// 초음파 센서 변수
+volatile float ultrasonic_distance = 0.0;  // 초음파 센서 거리 (cm)
 
 byte Pixel[NPIXELS];          // 원본 픽셀 데이터
 byte PixelBuffer[NPIXELS];    // 전송용 버퍼
@@ -241,13 +256,46 @@ float calculate_pd_steering(float line_center)
     previous_error = error;
     
     // 조향각 제한 (-30 ~ +30도)
-    if (steering_output > 30.0) {
-        steering_output = 30.0;
-    } else if (steering_output < -30.0) {
-        steering_output = -30.0;
+    if (steering_output > 37.0) {
+        steering_output = 37.0;
+    } else if (steering_output < -37.0) {
+        steering_output = -37.0;
     }
     
     return steering_output;
+}
+
+//====================================================================
+// ULTRASONIC SENSOR FUNCTIONS
+//====================================================================
+
+float read_ultrasonic_distance()
+{
+    // NewPing을 사용한 거리 측정
+    // ping_cm()은 블로킹이지만 짧은 시간 (29ms 최대)
+    unsigned int distance = sonar.ping_cm();
+    
+    // 0은 거리가 범위를 벗어났거나 측정 실패
+    if (distance == 0)
+    {
+        return -1.0;  // 측정 오류
+    }
+    
+    return (float)distance;
+}
+
+// 비블로킹 방식의 초음파 읽기 (필요 시 사용)
+float read_ultrasonic_median()
+{
+    // 5번 측정하여 중간값 반환 (노이즈 제거)
+    unsigned int distance = sonar.ping_median(5);
+    
+    if (distance == 0)
+    {
+        return -1.0;
+    }
+    
+    return (float)distance;
 }
 
 //====================================================================
@@ -293,7 +341,7 @@ void Steering_Control(float s_angle)
 }
 
 // 임계값 설정 (setup 내에서 static으로 선언하여 메모리에 유지)
-static int cameraThreshold = 70; // 기본값 128, 필요에 따라 변경 가능
+static int cameraThreshold = 120; // 기본값 128, 필요에 따라 변경 가능
 
 void setup()
 {
@@ -322,6 +370,8 @@ void setup()
     pinMode(MOTOR_DIR_PIN, OUTPUT);
     pinMode(MOTOR_PWM_PIN, OUTPUT);
     
+    // 초음파 센서는 NewPing이 자동으로 핀 설정함
+    
     // 엔코더 초기화
     interrupt_setup();
 
@@ -337,13 +387,14 @@ void setup()
     xSerialSemaphore = xSemaphoreCreateMutex();
     xDataSemaphore = xSemaphoreCreateMutex();
     xSteeringSemaphore = xSemaphoreCreateMutex();
+    xUltrasonicSemaphore = xSemaphoreCreateMutex();
 
-    if (xSerialSemaphore != NULL && xDataSemaphore != NULL && xSteeringSemaphore != NULL)
+    if (xSerialSemaphore != NULL && xDataSemaphore != NULL && xSteeringSemaphore != NULL && xUltrasonicSemaphore != NULL)
     {
         // 시리얼 송신 태스크 생성
         xTaskCreate(TaskSerial,
                     "Serial",
-                    256, // 스택 크기 증가
+                    512, // 스택 크기 증가
                     NULL,
                     2, // 우선순위
                     &xSerialTaskHandle);
@@ -351,7 +402,7 @@ void setup()
         // 카메라 읽기 태스크 생성 (임계값 전달)
         xTaskCreate(TaskCamera,
                     "Camera",
-                    256,                       // 스택 크기 증가
+                    1024,                       // 스택 크기 증가
                     (void *) &cameraThreshold, // threshold 값 전달
                     1,                         // 우선순위
                     &xCameraTaskHandle);
@@ -359,10 +410,18 @@ void setup()
         // 제어 태스크 생성
         xTaskCreate(TaskControl,
                     "Control",
-                    256,    // 스택 크기
+                    512,    // 스택 크기
                     NULL,
                     3,      // 우선순위 (가장 높음)
                     &xControlTaskHandle);
+
+        // 초음파 센서 태스크 생성
+        xTaskCreate(TaskUltrasonic,
+                    "Ultrasonic",
+                    256,    // 스택 크기
+                    NULL,
+                    1,      // 우선순위 (낮음)
+                    &xUltrasonicTaskHandle);
 
         // WDT 활성화 (2초 타임아웃)
         wdt_enable(WDTO_2S);
@@ -496,7 +555,7 @@ void TaskControl(void *pvParameters)
 {
     (void) pvParameters;
 
-    const TickType_t xFrequency = pdMS_TO_TICKS(20); // 20ms = 50Hz (서보 제어 주기)
+    const TickType_t xFrequency = pdMS_TO_TICKS(25); // 20ms = 50Hz (서보 제어 주기)
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     for (;;)
@@ -510,7 +569,7 @@ void TaskControl(void *pvParameters)
                 break;
             case 1:
                 // lane_control 미션 로직
-                motor_control(true, 200);
+                motor_control(true, 250);
                 Steering_Control(vision_steer_angle);
                 
                 // 제어 상태는 Serial Task에서 출력됨
@@ -542,6 +601,42 @@ void TaskControl(void *pvParameters)
     //Enable_Camera();
     //Enable_Serial();
     //Disable_Serial();
+}
+
+// 초음파 센서 태스크
+void TaskUltrasonic(void *pvParameters)
+{
+    (void) pvParameters;
+    
+    // 최적 주기 설정:
+    // - 벽 추종: 33ms (30Hz) - 빠른 반응 필요
+    // - 일반 감지: 50ms (20Hz) - 안정적
+    // - 에너지 절약: 100ms (10Hz)
+    const TickType_t xFrequency = pdMS_TO_TICKS(33); // 33ms = 30Hz (벽 추종용)
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    
+    for (;;)
+    {
+        // WDT 리셋
+        wdt_reset();
+        
+        // 거리 측정
+        float distance = read_ultrasonic_distance();
+        
+        // 유효한 측정값인 경우에만 업데이트
+        if (distance > 0)
+        {
+            // 세마포어로 보호하여 거리값 저장
+            if (xSemaphoreTake(xUltrasonicSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+            {
+                ultrasonic_distance = distance;
+                xSemaphoreGive(xUltrasonicSemaphore);
+            }
+        }
+        
+        // 정확한 50ms 주기 유지
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
 }
 
 void loop()
