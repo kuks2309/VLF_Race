@@ -3,7 +3,7 @@
 #include <avr/io.h>  // AVR 레지스터 정의 포함
 #include <avr/wdt.h> // Watchdog Timer 헤더
 #include <semphr.h>
-#include <NewPing.h> // NewPing 라이브러리
+#include <Wire.h>    // I2C 통신용
 
 // Camera Control
 #define TSL1401_CLK 12 // TSL1401 클럭 핀
@@ -25,10 +25,9 @@
 #define MAX_LEFT_Steering_Angle   -30
 #define MAX_RIGHT_Steering_Angle   30
 
-// Ultrasonic Sensor
-#define TRIG_PIN 9
-#define ECHO_PIN 8
-#define MAX_DISTANCE 400 // 최대 측정 거리 (cm)
+// TOF050C I2C Distance Sensor
+#define TOF050C_ADDRESS 0x52  // TOF050C I2C 기본 주소 (0xA4 >> 1)
+#define TOF_MAX_DISTANCE 500  // 최대 측정 거리 (cm)
 
 #define FASTADC 1 // ADC 속도 빠르게 설정
 
@@ -44,25 +43,22 @@
 SemaphoreHandle_t xSerialSemaphore;
 SemaphoreHandle_t xDataSemaphore; // 픽셀 데이터 보호용
 SemaphoreHandle_t xSteeringSemaphore; // 조향 데이터 보호용
-SemaphoreHandle_t xUltrasonicSemaphore; // 초음파 센서 데이터 보호용
+SemaphoreHandle_t xTOFSemaphore; // TOF 센서 데이터 보호용
 
 // 태스크 핸들 선언
 TaskHandle_t xCameraTaskHandle = NULL;
 TaskHandle_t xSerialTaskHandle = NULL;
 TaskHandle_t xControlTaskHandle = NULL;
-TaskHandle_t xUltrasonicTaskHandle = NULL;
+TaskHandle_t xTOFTaskHandle = NULL;
 
 // 태스크 함수 선언
 void TaskSerial(void *pvParameters);
 void TaskCamera(void *pvParameters);
 void TaskControl(void *pvParameters);
-void TaskUltrasonic(void *pvParameters);
+void TaskTOF(void *pvParameters);
 
 // Servo 객체
 Servo myServo;
-
-// NewPing 객체
-NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DISTANCE);
 
 // H 값 정의 (calculate_yaw_angle_y_axis 함수에서 사용)
 
@@ -83,8 +79,9 @@ float Kp = 0.42;  // 비례 게인 (라인 중심 오차에 대한 반응)
 float Kd = 1.5;  // 미분 게인 (오차 변화율에 대한 반응)
 float previous_error = 0.0;  // 이전 오차값 저장
 
-// 초음파 센서 변수
-volatile float ultrasonic_distance = 0.0;  // 초음파 센서 거리 (cm)
+// TOF 센서 변수
+volatile float tof_distance = 0.0;  // TOF 센서 거리 (mm)
+volatile bool tof_initialized = false;  // TOF 초기화 상태
 
 byte Pixel[NPIXELS];          // 원본 픽셀 데이터
 byte PixelBuffer[NPIXELS];    // 전송용 버퍼
@@ -266,36 +263,51 @@ float calculate_pd_steering(float line_center)
 }
 
 //====================================================================
-// ULTRASONIC SENSOR FUNCTIONS
+// TOF050C I2C SENSOR FUNCTIONS
 //====================================================================
 
-float read_ultrasonic_distance()
+// TOF050C 초기화 함수
+bool init_TOF050C()
 {
-    // NewPing을 사용한 거리 측정
-    // ping_cm()은 블로킹이지만 짧은 시간 (29ms 최대)
-    unsigned int distance = sonar.ping_cm();
+    Wire.begin();  // I2C 초기화
     
-    // 0은 거리가 범위를 벗어났거나 측정 실패
-    if (distance == 0)
+    // TOF050C 존재 확인
+    Wire.beginTransmission(TOF050C_ADDRESS);
+    if (Wire.endTransmission() != 0)
     {
-        return -1.0;  // 측정 오류
+        return false;  // 센서를 찾을 수 없음
     }
     
-    return (float)distance;
+    // 기본 설정 (400mm 모드, 연속 측정)
+    // TOF050C는 기본적으로 연속 측정 모드로 동작
+    
+    return true;
 }
 
-// 비블로킹 방식의 초음파 읽기 (필요 시 사용)
-float read_ultrasonic_median()
+// TOF050C로부터 거리 읽기 (mm 단위)
+float read_TOF050C_distance()
 {
-    // 5번 측정하여 중간값 반환 (노이즈 제거)
-    unsigned int distance = sonar.ping_median(5);
+    uint16_t distance = 0;
     
-    if (distance == 0)
+    // TOF050C로부터 2바이트 데이터 요청
+    Wire.requestFrom(TOF050C_ADDRESS, 2);
+    
+    if (Wire.available() >= 2)
     {
-        return -1.0;
+        // 높은 바이트 먼저 읽기 (Big Endian)
+        distance = Wire.read() << 8;
+        distance |= Wire.read();
+        
+        // 유효 범위 체크 (20mm ~ 5000mm)
+        if (distance < 20 || distance > 5000)
+        {
+            return -1.0;  // 측정 오류
+        }
+        
+        return (float)distance;  // mm 단위 반환
     }
     
-    return (float)distance;
+    return -1.0;  // 통신 오류
 }
 
 //====================================================================
@@ -370,7 +382,16 @@ void setup()
     pinMode(MOTOR_DIR_PIN, OUTPUT);
     pinMode(MOTOR_PWM_PIN, OUTPUT);
     
-    // 초음파 센서는 NewPing이 자동으로 핀 설정함
+    // TOF050C I2C 초기화
+    if (!init_TOF050C())
+    {
+        Serial.println("TOF050C initialization failed!");
+    }
+    else
+    {
+        Serial.println("TOF050C initialized successfully");
+        tof_initialized = true;
+    }
     
     // 엔코더 초기화
     interrupt_setup();
@@ -387,9 +408,9 @@ void setup()
     xSerialSemaphore = xSemaphoreCreateMutex();
     xDataSemaphore = xSemaphoreCreateMutex();
     xSteeringSemaphore = xSemaphoreCreateMutex();
-    xUltrasonicSemaphore = xSemaphoreCreateMutex();
+    xTOFSemaphore = xSemaphoreCreateMutex();
 
-    if (xSerialSemaphore != NULL && xDataSemaphore != NULL && xSteeringSemaphore != NULL && xUltrasonicSemaphore != NULL)
+    if (xSerialSemaphore != NULL && xDataSemaphore != NULL && xSteeringSemaphore != NULL && xTOFSemaphore != NULL)
     {
         // 시리얼 송신 태스크 생성
         xTaskCreate(TaskSerial,
@@ -415,13 +436,13 @@ void setup()
                     3,      // 우선순위 (가장 높음)
                     &xControlTaskHandle);
 
-        // 초음파 센서 태스크 생성
-        xTaskCreate(TaskUltrasonic,
-                    "Ultrasonic",
+        // TOF 센서 태스크 생성
+        xTaskCreate(TaskTOF,
+                    "TOF",
                     256,    // 스택 크기
                     NULL,
                     1,      // 우선순위 (낮음)
-                    &xUltrasonicTaskHandle);
+                    &xTOFTaskHandle);
 
         // WDT 활성화 (2초 타임아웃)
         wdt_enable(WDTO_2S);
@@ -603,16 +624,16 @@ void TaskControl(void *pvParameters)
     //Disable_Serial();
 }
 
-// 초음파 센서 태스크
-void TaskUltrasonic(void *pvParameters)
+// TOF 센서 태스크
+void TaskTOF(void *pvParameters)
 {
     (void) pvParameters;
     
     // 최적 주기 설정:
-    // - 벽 추종: 33ms (30Hz) - 빠른 반응 필요
+    // - TOF050C는 최대 100Hz(10ms) 까지 지원
+    // - 벽 추종: 20ms (50Hz) - 빠른 반응
     // - 일반 감지: 50ms (20Hz) - 안정적
-    // - 에너지 절약: 100ms (10Hz)
-    const TickType_t xFrequency = pdMS_TO_TICKS(33); // 33ms = 30Hz (벽 추종용)
+    const TickType_t xFrequency = pdMS_TO_TICKS(20); // 20ms = 50Hz (벽 추종용)
     TickType_t xLastWakeTime = xTaskGetTickCount();
     
     for (;;)
@@ -620,21 +641,25 @@ void TaskUltrasonic(void *pvParameters)
         // WDT 리셋
         wdt_reset();
         
-        // 거리 측정
-        float distance = read_ultrasonic_distance();
-        
-        // 유효한 측정값인 경우에만 업데이트
-        if (distance > 0)
+        // TOF 센서가 초기화된 경우에만 측정
+        if (tof_initialized)
         {
-            // 세마포어로 보호하여 거리값 저장
-            if (xSemaphoreTake(xUltrasonicSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+            // 거리 측정 (mm 단위)
+            float distance = read_TOF050C_distance();
+            
+            // 유효한 측정값인 경우에만 업데이트
+            if (distance > 0)
             {
-                ultrasonic_distance = distance;
-                xSemaphoreGive(xUltrasonicSemaphore);
+                // 세마포어로 보호하여 거리값 저장
+                if (xSemaphoreTake(xTOFSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+                {
+                    tof_distance = distance;  // mm 단위로 저장
+                    xSemaphoreGive(xTOFSemaphore);
+                }
             }
         }
         
-        // 정확한 50ms 주기 유지
+        // 정확한 주기 유지
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }

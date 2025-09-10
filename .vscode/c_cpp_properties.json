@@ -19,6 +19,7 @@
                 "/home/amap/arduino-1.8.19/hardware/arduino/avr/variants/mega",
                 "/home/amap/Arduino/libraries/FreeRTOS/src",
                 "/home/amap/arduino-1.8.19/libraries/Servo/src",
+                "/home/amap/arduino-1.8.19/hardware/arduino/avr/libraries/Wire/src",
                 "/home/amap/arduino-1.8.19/hardware/tools/avr/lib/gcc/avr/7.3.0/include",
                 "/home/amap/arduino-1.8.19/hardware/tools/avr/lib/gcc/avr/7.3.0/include-fixed",
                 "/home/amap/arduino-1.8.19/hardware/tools/avr/avr/include"
