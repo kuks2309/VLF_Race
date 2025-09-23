@@ -1,17 +1,25 @@
 #include <Arduino_FreeRTOS.h>
 #include <Servo.h>
-#include <avr/io.h>  // AVR 레지스터 정의 포함
-#include <avr/wdt.h> // Watchdog Timer 헤더
+#include <avr/io.h>  // AVR register definitions
+#include <avr/wdt.h> // Watchdog Timer header
 #include <semphr.h>
-#include <Wire.h>    // I2C 통신용
+#include <Wire.h>    // I2C communication
+#include <VL53L0X.h> // VL53L0X ToF sensor
+#include "MPU6050_Simple.h" // MPU6050 IMU sensor
+#include "RecursiveMovingAverage.h" // Moving average filter
 
 // Camera Control
-#define TSL1401_CLK 12 // TSL1401 클럭 핀
-#define TSL1401_SI 13  // TSL1401 SI 핀
-#define TSL1401_AO A0  // TSL1401 아날로그 출력 핀
-#define NPIXELS 128    // 총 픽셀 수
-#define Camera_calibration 2.1  // 펙셀을 mm로 바꾸는 계수
-#define H 250.0 // 카메라와 바퀴축 사이 거리 mm
+#define TSL1401_CLK 12 // TSL1401 clock pin
+#define TSL1401_SI 13  // TSL1401 SI pin
+#define TSL1401_AO A0  // TSL1401 analog output pin
+#define NPIXELS 128    // Total pixel count
+#define Camera_calibration 2.1  // Pixel to mm conversion factor
+#define H 250.0 // Distance between camera and wheel axis in mm
+
+//////////////////////////// Pulse 관련 ////////////////
+#define pulse 232.0
+#define pulse_m 1160.0
+double  pulse_distance;
 
 // Motor Control
 #define MOTOR_DIR_PIN 4
@@ -25,13 +33,18 @@
 #define MAX_LEFT_Steering_Angle   -30
 #define MAX_RIGHT_Steering_Angle   30
 
-// TOF050C I2C Distance Sensor
-#define TOF050C_ADDRESS 0x52  // TOF050C I2C 기본 주소 (0xA4 >> 1)
-#define TOF_MAX_DISTANCE 500  // 최대 측정 거리 (cm)
+// VL53L0X ToF Sensor Pins and Addresses
+#define XSHUT_PIN_R 11 // Right sensor
+#define XSHUT_PIN_C 10 // Center sensor
+#define XSHUT_PIN_L 9  // Left sensor
 
-#define FASTADC 1 // ADC 속도 빠르게 설정
+#define SENSOR_R_ADDRESS 0x30
+#define SENSOR_C_ADDRESS 0x31
+#define SENSOR_L_ADDRESS 0x32
 
-// ADC 레지스터 조작을 위한 매크로 정의 (FASTADC에서 사용)
+#define FASTADC 1 // Fast ADC setting
+
+// Macro definitions for ADC register manipulation (used in FASTADC)
 #ifndef sbi
 #define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
 #endif
@@ -39,53 +52,104 @@
 #define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
 #endif
 
-// 세마포어 선언
+// Semaphore declarations
 SemaphoreHandle_t xSerialSemaphore;
-SemaphoreHandle_t xDataSemaphore; // 픽셀 데이터 보호용
-SemaphoreHandle_t xSteeringSemaphore; // 조향 데이터 보호용
-SemaphoreHandle_t xTOFSemaphore; // TOF 센서 데이터 보호용
+SemaphoreHandle_t xDataSemaphore; // Pixel data protection
+SemaphoreHandle_t xSteeringSemaphore; // Steering data protection
+SemaphoreHandle_t xVL53L0XSemaphore; // VL53L0X sensor data protection
+SemaphoreHandle_t xIMUSemaphore; // IMU sensor data protection
+SemaphoreHandle_t xI2CSemaphore; // I2C bus protection
 
-// 태스크 핸들 선언
+// Task handle declarations
 TaskHandle_t xCameraTaskHandle = NULL;
 TaskHandle_t xSerialTaskHandle = NULL;
 TaskHandle_t xControlTaskHandle = NULL;
-TaskHandle_t xTOFTaskHandle = NULL;
+TaskHandle_t xVL53L0XTaskHandle = NULL;
+TaskHandle_t xIMUTaskHandle = NULL;
 
-// 태스크 함수 선언
+// Task function declarations
 void TaskSerial(void *pvParameters);
 void TaskCamera(void *pvParameters);
 void TaskControl(void *pvParameters);
-void TaskTOF(void *pvParameters);
+void TaskVL53L0X(void *pvParameters);
+void TaskIMU(void *pvParameters);
 
-// Servo 객체
+// Servo object
 Servo myServo;
 
-// H 값 정의 (calculate_yaw_angle_y_axis 함수에서 사용)
+// VL53L0X sensor objects
+VL53L0X sensorR;
+VL53L0X sensorC;
+VL53L0X sensorL;
+
+// MPU6050 IMU sensor object
+MPU6050_Simple mpu;
+
+// Moving average filter for IMU yaw angle
+RecursiveMovingAverage yawFilter;
+
+// Moving average filter for TOF Sensors
+RecursiveMovingAverage tofFilterR;  // Right sensor filter
+RecursiveMovingAverage tofFilterC;  // Center sensor filter
+RecursiveMovingAverage tofFilterL;  // Left sensor filter
+
+// H value definition (used in calculate_yaw_angle_y_axis function)
 
 
-// 태스크 제어 플래그
-volatile bool enableCamera = true;      // true: 카메라 실행, false: 카메라 정지
-volatile bool cameraTaskRunning = true; // 현재 카메라 태스크 상태
-volatile bool serialTaskRunning = true; // 현재 시리얼 태스크 상태
+// Task control flags
+volatile bool enableCamera = true;      // true: camera running, false: camera stopped
+volatile bool cameraTaskRunning = true; // Current camera task status
+volatile bool serialTaskRunning = true; // Current serial task status
+volatile bool vl53l0xTaskRunning = true; // Current VL53L0X task status
 
-// 조향 제어 변수
-volatile float steering_angle = 0.0;    // 계산된 조향 각도
-volatile float vision_steer_angle = 0.0; // 비전 기반 조향 각도
-volatile float line_center_pos = NPIXELS / 2.0; // 라인 중심 위치 (무게 중심)
-volatile int mission_flag = 0;          // 미션 상태 플래그
+// VL53L0X sensor variables
+volatile uint16_t vl53l0x_distance_r = 0;  // Right sensor distance (mm)
+volatile uint16_t vl53l0x_distance_c = 0;  // Center sensor distance (mm)
+volatile uint16_t vl53l0x_distance_l = 0;  // Left sensor distance (mm)
+volatile bool vl53l0x_initialized = false;  // VL53L0X initialization status
 
-// PD 제어 변수
-float Kp = 0.42;  // 비례 게인 (라인 중심 오차에 대한 반응)
-float Kd = 1.5;  // 미분 게인 (오차 변화율에 대한 반응)
-float previous_error = 0.0;  // 이전 오차값 저장
+// IMU sensor variables
+volatile float imu_roll = 0.0;   // Left-right tilt (degrees)
+volatile float imu_pitch = 0.0;  // Front-back tilt (degrees)
+volatile float imu_yaw = 0.0;    // Left-right rotation (degrees)
+volatile float imu_yaw_filtered = 0.0;  // Filtered yaw angle using moving average
+volatile bool imu_initialized = false;  // IMU initialization status
 
-// TOF 센서 변수
-volatile float tof_distance = 0.0;  // TOF 센서 거리 (mm)
-volatile bool tof_initialized = false;  // TOF 초기화 상태
+// Steering control variables
+volatile float steering_angle = 0.0;    // Calculated steering angle
+volatile float vision_steer_angle = 0.0; // Vision-based steering angle
+volatile float line_center_pos = NPIXELS / 2.0; // Line center position (center of mass)
+volatile int mission_flag = 0;          // Mission state flag
 
-byte Pixel[NPIXELS];          // 원본 픽셀 데이터
-byte PixelBuffer[NPIXELS];    // 전송용 버퍼
-byte threshold_data[NPIXELS]; // 임계값 처리된 데이터
+// PD control variables for Lane Control
+float Kp = 0.42;  // Proportional gain (response to line center error)
+float Kd = 1.5;  // Derivative gain (response to error rate of change)
+float previous_error = 0.0;  // Store previous error value
+
+
+// PD control variables for Yaw Control
+float Kp_yaw = 0.42;  // Proportional gain (response to line center error)
+float Kd_yaw = 1.5;  // Derivative gain (response to error rate of change)
+float previous_error_yaw = 0.0;  // Store previous error value
+
+// PD control variables for Wall follwoing Control
+float Kp_wall = 0.42;  // Proportional gain (response to line center error)
+float Kd_wall = 1.5;  // Derivative gain (response to error rate of change)
+float previous_error_wall = 0.0;  // Store previous error value
+
+// Encoder variables
+volatile long encoderPos = 0;
+
+// Camera threshold setting
+static int cameraThreshold = 120; // Default 128, can be changed as needed
+
+
+byte Pixel[NPIXELS];          // Original pixel data
+byte PixelBuffer[NPIXELS];    // Transmission buffer
+byte threshold_data[NPIXELS]; // Threshold processed data
+
+// Yaw Angle
+float current_yaw_angle = 0.0;
 
 //====================================================================
 // CAMERA CONTROL FUNCTIONS
@@ -100,7 +164,7 @@ void Enable_Camera()
 
         if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
         {
-            Serial.println("Camera task enabled");
+            Serial1.println("Camera task enabled");
             xSemaphoreGive(xSerialSemaphore);
         }
     }
@@ -115,13 +179,13 @@ void Disable_Camera()
 
         if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
         {
-            Serial.println("Camera task disabled");
+            Serial1.println("Camera task disabled");
             xSemaphoreGive(xSerialSemaphore);
         }
     }
 }
 
-// 시리얼 태스크 제어 함수
+// Serial task control functions
 void Enable_Serial()
 {
     if (xSerialTaskHandle != NULL && !serialTaskRunning)
@@ -131,7 +195,7 @@ void Enable_Serial()
 
         if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
         {
-            Serial.println("Serial task enabled");
+            Serial1.println("Serial task enabled");
             xSemaphoreGive(xSerialSemaphore);
         }
     }
@@ -143,17 +207,49 @@ void Disable_Serial()
     {
         vTaskSuspend(xSerialTaskHandle);
         serialTaskRunning = false;
-        
-        // 시리얼 태스크가 비활성화되면 마지막 메시지 출력
+
+        // Output final message when serial task is disabled
         if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
         {
-            Serial.println("Serial task disabled");
+            Serial1.println("Serial task disabled");
             xSemaphoreGive(xSerialSemaphore);
         }
     }
 }
 
-// 임계값 기반 이진화 함수 (값이 threshold 이상이면 1, 아니면 0)
+// VL53L0X task control functions
+void Enable_VL53L0X()
+{
+    if (xVL53L0XTaskHandle != NULL && !vl53l0xTaskRunning)
+    {
+        vTaskResume(xVL53L0XTaskHandle);
+        vl53l0xTaskRunning = true;
+
+        if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            Serial1.println("VL53L0X task enabled");
+            xSemaphoreGive(xSerialSemaphore);
+        }
+    }
+}
+
+void Disable_VL53L0X()
+{
+    if (xVL53L0XTaskHandle != NULL && vl53l0xTaskRunning)
+    {
+        vTaskSuspend(xVL53L0XTaskHandle);
+        vl53l0xTaskRunning = false;
+
+        // Output final message when VL53L0X task is disabled
+        if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            Serial1.println("VL53L0X task disabled");
+            xSemaphoreGive(xSerialSemaphore);
+        }
+    }
+}
+
+// Threshold-based binarization function (1 if value >= threshold, 0 otherwise)
 void line_threshold(int threshold)
 {
     for (int i = 0; i < NPIXELS; i++)
@@ -185,10 +281,10 @@ float find_line_center(void)
     return line_center;
 }
 
-// 카메라 데이터 읽기 (analogRead / 4 → 0~255 범위로 변환)
+// Read camera data (analogRead / 4 → convert to 0~255 range)
 void read_TSL1401_camera()
 {
-    // SI 펄스 시작
+    // Start SI pulse
     digitalWrite(TSL1401_SI, HIGH);
     digitalWrite(TSL1401_CLK, HIGH);
     delayMicroseconds(1);
@@ -196,7 +292,7 @@ void read_TSL1401_camera()
     digitalWrite(TSL1401_SI, LOW);
     delayMicroseconds(1);
 
-    // 픽셀 값 읽기
+    // Read pixel values
     for (int i = 0; i < NPIXELS; i++)
     {
         digitalWrite(TSL1401_CLK, HIGH);
@@ -219,8 +315,62 @@ void send_pixel_data()
 }
 
 //====================================================================
+// Maze CONTROL FUNCTIONS
+//====================================================================
+
+bool detect_maze_entrance(void)
+{
+    if( (vl53l0x_distance_r <= 250) && (vl53l0x_distance_l <= 250 ) && (vl53l0x_distance_c <= 500))
+    {
+       return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+//====================================================================
 // MOTOR CONTROL FUNCTIONS
 //====================================================================
+
+// Car Wall Following Control
+void car_wall_following(void)
+{
+    // Calculate error between right and left wall distances
+    float error = vl53l0x_distance_r - vl53l0x_distance_l;
+
+    // Calculate derivative term (error rate of change)
+    float derivative = error - previous_error_wall;
+
+    // Apply PD control
+    float wall_control_steering_angle = (Kp_wall * error) + (Kd_wall * derivative);
+
+    // Update previous error value
+    previous_error_wall = error;
+
+    // Apply steering control with calculated angle
+    Steering_Control(wall_control_steering_angle);
+}
+
+// Car Yaw Control
+void car_yaw_control(float target_yaw)
+{
+    // Calculate error between target and current yaw angle
+    float error = target_yaw - imu_yaw_filtered;
+
+    // Calculate derivative term (error rate of change)
+    float derivative = error - previous_error_yaw;
+
+    // Apply PD control
+    float yaw_control_steering_angle = (Kp_yaw * error) + (Kd_yaw * derivative);
+
+    // Update previous error value
+    previous_error_yaw = error;
+
+    // Apply steering control with calculated angle
+    Steering_Control(yaw_control_steering_angle);
+}
 
 void motor_control(int8_t direction, uint8_t motor_speed)
 {
@@ -235,24 +385,24 @@ void motor_control(int8_t direction, uint8_t motor_speed)
     analogWrite(MOTOR_PWM_PIN, motor_speed);
 }
 
-// PD 제어 함수 - 라인 중심 오차를 기반으로 조향각 계산
+// PD control function - calculate steering angle based on line center error
 float calculate_pd_steering(float line_center)
 {
-    // 오차 계산: 중심(64)에서 벗어난 정도
-    // 오차가 양수면 라인이 오른쪽에 있음 -> 오른쪽으로 조향
-    // 오차가 음수면 라인이 왼쪽에 있음 -> 왼쪽으로 조향
-    float error = line_center - (NPIXELS / 2.0);  // 64픽셀이 중심
+    // Error calculation: deviation from center (64)
+    // Positive error means line is on the right -> steer right
+    // Negative error means line is on the left -> steer left
+    float error = line_center - (NPIXELS / 2.0);  // 64 pixels is center
     
-    // 미분항 계산 (오차 변화율)
+    // Calculate derivative term (error rate of change)
     float derivative = error - previous_error;
     
-    // PD 제어 출력 계산
+    // Calculate PD control output
     float steering_output = (Kp * error) + (Kd * derivative);
     
-    // 이전 오차값 업데이트
+    // Update previous error value
     previous_error = error;
     
-    // 조향각 제한 (-30 ~ +30도)
+    // Limit steering angle (-30 ~ +30 degrees)
     if (steering_output > 37.0) {
         steering_output = 37.0;
     } else if (steering_output < -37.0) {
@@ -263,60 +413,158 @@ float calculate_pd_steering(float line_center)
 }
 
 //====================================================================
-// TOF050C I2C SENSOR FUNCTIONS
+// IMU SENSOR FUNCTIONS
 //====================================================================
 
-// TOF050C 초기화 함수
-bool init_TOF050C()
+bool IMU_Sensor_Setup()
 {
-    Wire.begin();  // I2C 초기화
-    
-    // TOF050C 존재 확인
-    Wire.beginTransmission(TOF050C_ADDRESS);
-    if (Wire.endTransmission() != 0)
-    {
-        return false;  // 센서를 찾을 수 없음
+    // Set I2C communication speed (400kHz)
+    Wire.setClock(400000);
+
+    // Initialize MPU sensor
+    Serial1.println("Initializing IMU sensor...");
+    Serial1.flush();
+
+    if (!mpu.begin()) {
+        Serial1.println("IMU sensor initialization failed!");
+        Serial1.println("Check IMU connection.");
+        Serial1.flush();
+        return false;
     }
-    
-    // 기본 설정 (400mm 모드, 연속 측정)
-    // TOF050C는 기본적으로 연속 측정 모드로 동작
-    
-    return true;
+
+    Serial1.println("IMU sensor initialized successfully!");
+    Serial1.flush();
+
+    // Check initial orientation (within 10 degrees)
+    Serial1.println("Checking initial orientation...");
+    if (mpu.checkInitialOrientation(10.0)) {
+        Serial1.println("IMU orientation is correct!");
+    } else {
+        Serial1.println("IMU sensor is tilted. Please level the sensor...");
+        // Wait until sensor is level within 5 degrees (max 5 seconds)
+        unsigned long startTime = millis();
+        while (!mpu.checkInitialOrientation(5.0) && (millis() - startTime) < 5000) {
+            delay(100);
+        }
+        if (mpu.checkInitialOrientation(5.0)) {
+            Serial1.println("IMU sensor leveled successfully!");
+        } else {
+            Serial1.println("WARNING: IMU sensor not perfectly level, continuing anyway...");
+        }
+    }
+
+    // Perform calibration (500 samples)
+    Serial1.println("Calibrating IMU sensor...");
+    Serial1.println("Keep the sensor still during calibration!");
+    mpu.calibrate(500);
+    Serial1.println("IMU calibration completed!");
+    Serial1.flush();
+
+    // Reset orientation angles
+    mpu.resetOrientation();
+    Serial1.println("IMU orientation reset completed!");
+
+    // Connection test
+    if (mpu.testConnection()) {
+        Serial1.println("IMU connection test passed!");
+        Serial1.println("------------------------");
+        Serial1.flush();
+        imu_initialized = true;
+        return true;
+    } else {
+        Serial1.println("IMU connection test failed!");
+        Serial1.flush();
+        return false;
+    }
 }
 
-// TOF050C로부터 거리 읽기 (mm 단위)
-float read_TOF050C_distance()
+// Read IMU sensor data and update global variables
+void read_IMU_data()
 {
-    uint16_t distance = 0;
-    
-    // TOF050C로부터 2바이트 데이터 요청
-    Wire.requestFrom(TOF050C_ADDRESS, 2);
-    
-    if (Wire.available() >= 2)
-    {
-        // 높은 바이트 먼저 읽기 (Big Endian)
-        distance = Wire.read() << 8;
-        distance |= Wire.read();
-        
-        // 유효 범위 체크 (20mm ~ 5000mm)
-        if (distance < 20 || distance > 5000)
-        {
-            return -1.0;  // 측정 오류
+    if (imu_initialized) {
+        // Protect I2C bus access
+        if (xSemaphoreTake(xI2CSemaphore, pdMS_TO_TICKS(50)) == pdTRUE) {
+            // Update sensor data
+            mpu.update();
+
+            xSemaphoreGive(xI2CSemaphore);
+
+            // Read orientation angles and update global variables
+            if (xSemaphoreTake(xIMUSemaphore, pdMS_TO_TICKS(10)) == pdTRUE) {
+                imu_roll = mpu.getRoll();
+                imu_pitch = mpu.getPitch();
+                imu_yaw = mpu.getYaw();
+
+                // Apply moving average filter to yaw angle
+                imu_yaw_filtered = yawFilter.update(imu_yaw, imu_yaw_filtered);
+
+                xSemaphoreGive(xIMUSemaphore);
+            }
         }
-        
-        return (float)distance;  // mm 단위 반환
     }
-    
-    return -1.0;  // 통신 오류
 }
+
+//====================================================================
+// VL53L0X SENSOR FUNCTIONS
+//====================================================================
+
+void VL530L0x_Sensor_Setup()
+{
+    Wire.begin();
+
+    // Set XSHUT pins as output
+    pinMode(XSHUT_PIN_R, OUTPUT);
+    pinMode(XSHUT_PIN_C, OUTPUT);
+    pinMode(XSHUT_PIN_L, OUTPUT);
+
+    // Disable all sensors
+    digitalWrite(XSHUT_PIN_R, LOW);
+    digitalWrite(XSHUT_PIN_C, LOW);
+    digitalWrite(XSHUT_PIN_L, LOW);
+    delay(10);
+
+    // Initialize Right sensor and change address
+    digitalWrite(XSHUT_PIN_R, HIGH);
+    delay(10);
+    sensorR.init();
+    sensorR.setAddress(SENSOR_R_ADDRESS);
+    Serial1.println("Right sensor initialized");
+    Serial1.flush();
+
+    // Initialize Center sensor and change address
+    digitalWrite(XSHUT_PIN_C, HIGH);
+    delay(10);
+    sensorC.init();
+    sensorC.setAddress(SENSOR_C_ADDRESS);
+    Serial1.println("Center sensor initialized");
+    Serial1.flush();
+
+    // Initialize Left sensor and change address
+    digitalWrite(XSHUT_PIN_L, HIGH);
+    delay(10);
+    sensorL.init();
+    sensorL.setAddress(SENSOR_L_ADDRESS);
+    Serial1.println("Left sensor initialized");
+    Serial1.flush();
+
+    // Start continuous reading mode
+    sensorR.startContinuous();
+    sensorC.startContinuous();
+    sensorL.startContinuous();
+
+    Serial1.println("All VL530L0x sensors ready!");
+    Serial1.println("------------------------");
+    Serial1.flush();
+
+    vl53l0x_initialized = true;
+}
+
 
 //====================================================================
 // ENCODER FUNCTIONS
 //====================================================================
 
-volatile long encoderPos = 0;
-
-void encoderB()
+void encoder_read()
 {
   delayMicroseconds(2);
   if (digitalRead(encodPinB1) == LOW) encoderPos++;
@@ -328,14 +576,35 @@ void reset_encoder(void)
   encoderPos = 0;
 }
 
+void encoder_to_distance(void)
+{
+
+    pulse_distance = encoderPos / pulse_m;
+
+}
+
 void interrupt_setup(void)
 {
   pinMode(encodPinA1, INPUT_PULLUP);        // quadrature encoder input A
   pinMode(encodPinB1, INPUT_PULLUP);        // quadrature encoder input B
-  attachInterrupt(0, encoderB, FALLING);    // update encoder position
+  attachInterrupt(0, encoder_read, FALLING);    // update encoder position
   TCCR1B = TCCR1B & 0b11111000 | 1;         // To prevent Motor Noise
 }
 
+float Steering_Angle_Limit(float s_angle, float limit)
+{
+    if(s_angle <= -limit)
+    {
+        s_angle = -limit;
+    }
+
+    if(s_angle >= limit)
+    {
+        s_angle = limit;
+    }
+
+    return s_angle;
+}
 
 void Steering_Control(float s_angle)
 {
@@ -352,8 +621,7 @@ void Steering_Control(float s_angle)
   myServo.write(STRAIGHT_ANGLE + s_angle); // 부호만 바꿀 것
 }
 
-// 임계값 설정 (setup 내에서 static으로 선언하여 메모리에 유지)
-static int cameraThreshold = 120; // 기본값 128, 필요에 따라 변경 가능
+// Threshold setting (moved to global section)
 
 void setup()
 {
@@ -361,17 +629,19 @@ void setup()
     wdt_disable();
 
     Serial.begin(115200);
-    #if defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__) || defined(__AVR_ATmega32U4__)
-    Serial1.begin(115200);  // Serial1 디버깅용 (Mega, Leonardo 등)
-    Serial1.println("Serial1 Debug Started at 115200 baud");
-    Serial.println("Serial1 initialized for debugging");
-    #else
-    Serial.println("Serial1 not available on this board");
-    #endif
-    while (!Serial)
+    while(!Serial)
     {
-        ; // 시리얼 포트가 연결될 때까지 대기
+        ;
     }
+    Serial1.begin(115200);  // Serial1 디버깅용
+    while(!Serial1)
+    {
+        ;
+    }
+    Serial1.println("Serial1 Debug Started at 115200 baud");
+    Serial1.flush();
+    Serial1.println("Serial1 initialized for debugging");
+    Serial1.flush();
 
     pinMode(TSL1401_CLK, OUTPUT);
     pinMode(TSL1401_SI, OUTPUT);
@@ -382,17 +652,16 @@ void setup()
     pinMode(MOTOR_DIR_PIN, OUTPUT);
     pinMode(MOTOR_PWM_PIN, OUTPUT);
     
-    // TOF050C I2C 초기화
-    if (!init_TOF050C())
-    {
-        Serial.println("TOF050C initialization failed!");
+    // VL53L0X 센서 초기화
+    VL530L0x_Sensor_Setup();
+
+    // IMU 센서 초기화
+    if (!IMU_Sensor_Setup()) {
+        Serial1.println("WARNING: IMU sensor not available, continuing without IMU.");
+        Serial1.flush();
+        imu_initialized = false;
     }
-    else
-    {
-        Serial.println("TOF050C initialized successfully");
-        tof_initialized = true;
-    }
-    
+
     // 엔코더 초기화
     interrupt_setup();
 
@@ -408,9 +677,11 @@ void setup()
     xSerialSemaphore = xSemaphoreCreateMutex();
     xDataSemaphore = xSemaphoreCreateMutex();
     xSteeringSemaphore = xSemaphoreCreateMutex();
-    xTOFSemaphore = xSemaphoreCreateMutex();
+    xVL53L0XSemaphore = xSemaphoreCreateMutex();
+    xIMUSemaphore = xSemaphoreCreateMutex();
+    xI2CSemaphore = xSemaphoreCreateMutex();
 
-    if (xSerialSemaphore != NULL && xDataSemaphore != NULL && xSteeringSemaphore != NULL && xTOFSemaphore != NULL)
+    if (xSerialSemaphore != NULL && xDataSemaphore != NULL && xSteeringSemaphore != NULL && xVL53L0XSemaphore != NULL && xIMUSemaphore != NULL && xI2CSemaphore != NULL)
     {
         // 시리얼 송신 태스크 생성
         xTaskCreate(TaskSerial,
@@ -436,13 +707,21 @@ void setup()
                     3,      // 우선순위 (가장 높음)
                     &xControlTaskHandle);
 
-        // TOF 센서 태스크 생성
-        xTaskCreate(TaskTOF,
-                    "TOF",
-                    256,    // 스택 크기
+        // VL53L0X sensor task creation
+        xTaskCreate(TaskVL53L0X,
+                    "VL53L0X",
+                    384,    // Stack size
                     NULL,
-                    1,      // 우선순위 (낮음)
-                    &xTOFTaskHandle);
+                    1,      // Priority (low)
+                    &xVL53L0XTaskHandle);
+
+        // IMU sensor task creation
+        xTaskCreate(TaskIMU,
+                    "IMU",
+                    256,    // Stack size
+                    NULL,
+                    1,      // Priority (low)
+                    &xIMUTaskHandle);
 
         // WDT 활성화 (2초 타임아웃)
         wdt_enable(WDTO_2S);
@@ -453,7 +732,8 @@ void setup()
     else
     {
         // 세마포어 생성 실패 시 처리
-        Serial.println("Failed to create semaphore");
+        Serial1.println("Failed to create semaphore");
+        Serial1.flush();
     }
 }
 
@@ -531,13 +811,13 @@ void TaskSerial(void *pvParameters)
             // 시리얼로 데이터 전송 (Serial 0번 사용)
             if (xSemaphoreTake(xSerialSemaphore, portMAX_DELAY) == pdTRUE)
             {
-                // 128개 픽셀 데이터 전송
+                // 128개 픽셀 데이터 전송 (Serial0로 카메라 데이터)
                 for (int i = 0; i < NPIXELS; i++)
                 {
                     Serial.print(localPixelBuffer[i]);
                     Serial.print(",");
                 }
-                
+
                 // 라인 중심 위치 값 추가 (129번째 값)
                 float center_value = line_center_pos;
                 float current_steer_angle = vision_steer_angle;
@@ -550,8 +830,7 @@ void TaskSerial(void *pvParameters)
                 Serial.print(center_value);
                 Serial.println();
                 
-                // Serial1로 디버깅 정보 출력 (Mega, Leonardo 등에서만)
-                #if defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__) || defined(__AVR_ATmega32U4__)
+                // Serial1로 디버깅 정보 출력
                 Serial1.print("LC:");
                 Serial1.print(center_value, 1);
                 Serial1.print(",SA:");
@@ -560,7 +839,6 @@ void TaskSerial(void *pvParameters)
                 Serial1.print(mission_flag);
                 Serial1.print(",Servo:");
                 Serial1.println(STRAIGHT_ANGLE + current_steer_angle);
-                #endif
                 
                 xSemaphoreGive(xSerialSemaphore);
             }
@@ -587,19 +865,50 @@ void TaskControl(void *pvParameters)
         {
             case 0:
                 // start_stop 미션 로직
+                if( vl53l0x_distance_c < 100)
+                {
+                    motor_control(true, 0);
+                }
+                else
+                {
+                    mission_flag = 1;
+                }
                 break;
             case 1:
                 // lane_control 미션 로직
                 motor_control(true, 250);
                 Steering_Control(vision_steer_angle);
-                
+
                 // 제어 상태는 Serial Task에서 출력됨
+                // maze inlet detection with continuous detection logic
+                {
+                    static int maze_detection_count = 0;
+                    const int MAZE_DETECTION_THRESHOLD = 3;  // 3회 연속 감지
+
+                    if (detect_maze_entrance()) 
+                    {
+                        maze_detection_count++;
+                        if (maze_detection_count >= MAZE_DETECTION_THRESHOLD) 
+                        {
+                            motor_control(true, 0);
+                            mission_flag = 2;
+                            maze_detection_count = 0;  // 리셋
+                            current_yaw_angle = imu_yaw_filtered;  // read filtered imu yaw angle
+                        }
+                    } 
+                    else 
+                    {
+                        maze_detection_count = 0;  // 조건 미만족 시 리셋
+                    }
+                }
+
                 break;
-            case 2:
-                // wall_following 미션 로직
+            case 2:  // turn90 미션 로직
+                car_yaw_control(current_yaw_angle - 90);
+
                 break;
             case 3:
-                // turn90 미션 로직
+               
                 break;
             case 4:
                 // 추가 미션 로직
@@ -619,55 +928,108 @@ void TaskControl(void *pvParameters)
     }
 
 
-    //Enable_Camera();
-    //Enable_Serial();
-    //Disable_Serial();
+    // 태스크 제어 예제:
+    // Enable_Camera();
+    // Disable_Camera();
+    // Enable_Serial();
+    // Disable_Serial();
+    // Enable_VL53L0X();
+    // Disable_VL53L0X();
 }
 
-// TOF 센서 태스크
-void TaskTOF(void *pvParameters)
+// VL53L0X 센서 태스크
+void TaskVL53L0X(void *pvParameters)
 {
     (void) pvParameters;
-    
-    // 최적 주기 설정:
-    // - TOF050C는 최대 100Hz(10ms) 까지 지원
-    // - 벽 추종: 20ms (50Hz) - 빠른 반응
+
+    // 측정 주기 설정:
+    // - VL53L0X는 최대 50Hz(20ms) 까지 안정적으로 동작
+    // - 벽 추종: 40ms (25Hz) - 안정적이고 빠른 반응
     // - 일반 감지: 50ms (20Hz) - 안정적
-    const TickType_t xFrequency = pdMS_TO_TICKS(20); // 20ms = 50Hz (벽 추종용)
+    const TickType_t xFrequency = pdMS_TO_TICKS(40); // 40ms = 25Hz
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    
+
     for (;;)
     {
         // WDT 리셋
         wdt_reset();
-        
-        // TOF 센서가 초기화된 경우에만 측정
-        if (tof_initialized)
+
+        // VL53L0X sensor measurement only if initialized
+        if (vl53l0x_initialized)
         {
-            // 거리 측정 (mm 단위)
-            float distance = read_TOF050C_distance();
-            
-            // 유효한 측정값인 경우에만 업데이트
-            if (distance > 0)
-            {
-                // 세마포어로 보호하여 거리값 저장
-                if (xSemaphoreTake(xTOFSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+            // Protect I2C bus access
+            if (xSemaphoreTake(xI2CSemaphore, pdMS_TO_TICKS(30)) == pdTRUE) {
+                // Read distance from each sensor (mm unit)
+                uint16_t dist_r = sensorR.readRangeContinuousMillimeters();
+                uint16_t dist_c = sensorC.readRangeContinuousMillimeters();
+                uint16_t dist_l = sensorL.readRangeContinuousMillimeters();
+
+                xSemaphoreGive(xI2CSemaphore);
+
+                // Protect distance values with semaphore
+                if (xSemaphoreTake(xVL53L0XSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
                 {
-                    tof_distance = distance;  // mm 단위로 저장
-                    xSemaphoreGive(xTOFSemaphore);
+                    // Valid range check (20mm ~ 2000mm)
+                    uint16_t valid_r = (dist_r < 20 || dist_r > 2000) ? 0 : dist_r;
+                    uint16_t valid_c = (dist_c < 20 || dist_c > 2000) ? 0 : dist_c;
+                    uint16_t valid_l = (dist_l < 20 || dist_l > 2000) ? 0 : dist_l;
+
+                    // Apply moving average filter to TOF sensor values
+                    vl53l0x_distance_r = tofFilterR.update(valid_r, vl53l0x_distance_r);
+                    vl53l0x_distance_c = tofFilterC.update(valid_c, vl53l0x_distance_c);
+                    vl53l0x_distance_l = tofFilterL.update(valid_l, vl53l0x_distance_l);
+                    xSemaphoreGive(xVL53L0XSemaphore);
+
+                    // Debug output (Serial1)
+                    #ifdef DEBUG_VL53L0X
+                    if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(5)) == pdTRUE)
+                    {
+                        Serial1.print("VL53[R:");
+                        Serial1.print(vl53l0x_distance_r);
+                        Serial1.print(",C:");
+                        Serial1.print(vl53l0x_distance_c);
+                        Serial1.print(",L:");
+                        Serial1.print(vl53l0x_distance_l);
+                        Serial1.println("]");
+                        xSemaphoreGive(xSerialSemaphore);
+                    }
+                    #endif
                 }
             }
         }
-        
+
         // 정확한 주기 유지
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+
+// IMU sensor task
+void TaskIMU(void *pvParameters)
+{
+    (void) pvParameters;
+
+    // Measurement period setting:
+    // - IMU data should be read frequently for accurate orientation
+    // - 50ms (20Hz) provides good balance between accuracy and performance
+    const TickType_t xFrequency = pdMS_TO_TICKS(50); // 50ms = 20Hz
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+
+    for (;;)
+    {
+        // WDT reset
+        wdt_reset();
+
+        // Read IMU data if initialized
+        read_IMU_data();
+
+        // Maintain accurate period
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
 void loop()
 {
-    // 테스트를 위해 mission_flag를 1로 설정하여 모터 제어 활성화
-    mission_flag = 1;
+    // mission_flag starts from initial value 0 and changes according to logic in TaskControl
     Enable_Serial();
     vTaskDelay(pdMS_TO_TICKS(10));
 }
