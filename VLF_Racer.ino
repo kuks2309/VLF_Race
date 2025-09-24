@@ -16,6 +16,14 @@
 #define Camera_calibration 2.1  // Pixel to mm conversion factor
 #define H 250.0 // Distance between camera and wheel axis in mm
 
+
+// Test Pin Setup
+
+#define TSL1401_TEST_PIN 42
+#define TOF_TEST_PIN   43
+#define CONTROL_TEST_PIN   44
+#define IMU_TEST_PIN   45
+
 //////////////////////////// Pulse 관련 ////////////////
 #define pulse 232.0
 #define pulse_m 1160.0
@@ -483,16 +491,16 @@ void read_IMU_data()
 {
     if (imu_initialized) {
         // Protect I2C bus access
-        if (xSemaphoreTake(xI2CSemaphore, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (xSemaphoreTake(xI2CSemaphore, pdMS_TO_TICKS(5)) == pdTRUE) {
             // Update sensor data
             mpu.update();
 
             xSemaphoreGive(xI2CSemaphore);
 
             // Read orientation angles and update global variables
-            if (xSemaphoreTake(xIMUSemaphore, pdMS_TO_TICKS(10)) == pdTRUE) {
-                imu_roll = mpu.getRoll();
-                imu_pitch = mpu.getPitch();
+            if (xSemaphoreTake(xIMUSemaphore, pdMS_TO_TICKS(5)) == pdTRUE) {
+                //imu_roll = mpu.getRoll();
+                //imu_pitch = mpu.getPitch();
                 imu_yaw = mpu.getYaw();
 
                 // Apply moving average filter to yaw angle
@@ -651,6 +659,13 @@ void setup()
 
     pinMode(MOTOR_DIR_PIN, OUTPUT);
     pinMode(MOTOR_PWM_PIN, OUTPUT);
+
+
+    // Test pin setup
+    pinMode(TSL1401_TEST_PIN, OUTPUT);
+    pinMode(TOF_TEST_PIN, OUTPUT);
+    pinMode(CONTROL_TEST_PIN, OUTPUT);
+    pinMode(IMU_TEST_PIN, OUTPUT);
     
     // VL53L0X 센서 초기화
     VL530L0x_Sensor_Setup();
@@ -688,7 +703,7 @@ void setup()
                     "Serial",
                     512, // 스택 크기 증가
                     NULL,
-                    2, // 우선순위
+                    0, // 우선순위 (최저)
                     &xSerialTaskHandle);
 
         // 카메라 읽기 태스크 생성 (임계값 전달)
@@ -696,7 +711,7 @@ void setup()
                     "Camera",
                     1024,                       // 스택 크기 증가
                     (void *) &cameraThreshold, // threshold 값 전달
-                    1,                         // 우선순위
+                    4,                         // 우선순위 (최고)
                     &xCameraTaskHandle);
 
         // 제어 태스크 생성
@@ -704,15 +719,15 @@ void setup()
                     "Control",
                     512,    // 스택 크기
                     NULL,
-                    3,      // 우선순위 (가장 높음)
+                    1,      // 우선순위 (최저)
                     &xControlTaskHandle);
 
         // VL53L0X sensor task creation
         xTaskCreate(TaskVL53L0X,
                     "VL53L0X",
-                    384,    // Stack size
+                    512,    // Stack size
                     NULL,
-                    1,      // Priority (low)
+                    3,      // Priority (높음)
                     &xVL53L0XTaskHandle);
 
         // IMU sensor task creation
@@ -720,9 +735,8 @@ void setup()
                     "IMU",
                     256,    // Stack size
                     NULL,
-                    1,      // Priority (low)
+                    2,      // Priority (중간)
                     &xIMUTaskHandle);
-
         // WDT 활성화 (2초 타임아웃)
         wdt_enable(WDTO_2S);
 
@@ -746,13 +760,16 @@ void TaskCamera(void *pvParameters)
     // pvParameters로 전달받은 threshold 값 추출
     int threshold = *((int *) pvParameters);
 
-    const TickType_t xFrequency = pdMS_TO_TICKS(40); // 40ms = 25Hz
+    const TickType_t xFrequency = pdMS_TO_TICKS(20); // 20ms = 50Hz
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     for (;;)
     {
-        // WDT 리셋 (태스크가 정상 동작 중임을 알림)
-        wdt_reset();
+        // 태스크 실행 시작을 알리는 신호 (디버깅용)
+        digitalWrite(TSL1401_TEST_PIN, HIGH);
+
+        // WDT 리셋 (removed - Control task resets WDT)
+        // wdt_reset();
 
         // 카메라 데이터 읽기
         read_TSL1401_camera();
@@ -770,16 +787,19 @@ void TaskCamera(void *pvParameters)
         line_threshold(threshold); // 전달받은 threshold 값 사용
 
         float center = find_line_center();
-        
+
         // 데이터 세마포어로 보호하여 라인 중심 위치 저장
         if (xSemaphoreTake(xSteeringSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
         {
             line_center_pos = center;
             xSemaphoreGive(xSteeringSemaphore);
         }
-        
+
         // PD 제어를 사용하여 조향각 계산
         vision_steer_angle = calculate_pd_steering(center);
+
+        // 태스크 실행 종료를 알리는 신호 (디버깅용)
+        digitalWrite(TSL1401_TEST_PIN, LOW);
 
         // 정확한 25Hz 주기 유지
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -799,8 +819,8 @@ void TaskSerial(void *pvParameters)
 
     for (;;)
     {
-        // WDT 리셋 (태스크가 정상 동작 중임을 알림)
-        wdt_reset();
+        // WDT 리셋 (removed - only Camera task resets WDT)
+        // wdt_reset();
 
         // 100ms마다 픽셀 데이터 전송
         if (xSemaphoreTake(xDataSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
@@ -854,12 +874,13 @@ void TaskControl(void *pvParameters)
 {
     (void) pvParameters;
 
-    const TickType_t xFrequency = pdMS_TO_TICKS(25); // 20ms = 50Hz (서보 제어 주기)
+    const TickType_t xFrequency = pdMS_TO_TICKS(40); // 40ms = 25Hz (서보 제어 주기)
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     for (;;)
     {
-        wdt_reset();
+        digitalWrite(CONTROL_TEST_PIN, HIGH);
+        wdt_reset(); // Control task resets WDT (shortest execution time)
 
         switch (mission_flag)
         {
@@ -923,7 +944,7 @@ void TaskControl(void *pvParameters)
                 mission_flag = 0;
                 break;
         }
-
+        digitalWrite(CONTROL_TEST_PIN, LOW);
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 
@@ -944,21 +965,25 @@ void TaskVL53L0X(void *pvParameters)
 
     // 측정 주기 설정:
     // - VL53L0X는 최대 50Hz(20ms) 까지 안정적으로 동작
-    // - 벽 추종: 40ms (25Hz) - 안정적이고 빠른 반응
-    // - 일반 감지: 50ms (20Hz) - 안정적
+    // - 벽 추종: 30ms (33.3Hz) - 안정적인 반응
+    // - 일반 감지: 30ms (33.3Hz) - 안정적이고 신뢰성 높은 감지
     const TickType_t xFrequency = pdMS_TO_TICKS(40); // 40ms = 25Hz
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     for (;;)
     {
-        // WDT 리셋
-        wdt_reset();
+        // 태스크 실행 시작 신호 (디버깅용) - 센서 초기화와 관계없이 동작
+         digitalWrite(TOF_TEST_PIN, HIGH);
+        
+        // WDT 리셋 (removed - only Camera task resets WDT)
+        // wdt_reset();
 
         // VL53L0X sensor measurement only if initialized
         if (vl53l0x_initialized)
         {
             // Protect I2C bus access
-            if (xSemaphoreTake(xI2CSemaphore, pdMS_TO_TICKS(30)) == pdTRUE) {
+            if (xSemaphoreTake(xI2CSemaphore, pdMS_TO_TICKS(5)) == pdTRUE) 
+            {
                 // Read distance from each sensor (mm unit)
                 uint16_t dist_r = sensorR.readRangeContinuousMillimeters();
                 uint16_t dist_c = sensorC.readRangeContinuousMillimeters();
@@ -967,7 +992,7 @@ void TaskVL53L0X(void *pvParameters)
                 xSemaphoreGive(xI2CSemaphore);
 
                 // Protect distance values with semaphore
-                if (xSemaphoreTake(xVL53L0XSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+                if (xSemaphoreTake(xVL53L0XSemaphore, pdMS_TO_TICKS(5)) == pdTRUE)
                 {
                     // Valid range check (20mm ~ 2000mm)
                     uint16_t valid_r = (dist_r < 20 || dist_r > 2000) ? 0 : dist_r;
@@ -979,24 +1004,12 @@ void TaskVL53L0X(void *pvParameters)
                     vl53l0x_distance_c = tofFilterC.update(valid_c, vl53l0x_distance_c);
                     vl53l0x_distance_l = tofFilterL.update(valid_l, vl53l0x_distance_l);
                     xSemaphoreGive(xVL53L0XSemaphore);
-
-                    // Debug output (Serial1)
-                    #ifdef DEBUG_VL53L0X
-                    if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(5)) == pdTRUE)
-                    {
-                        Serial1.print("VL53[R:");
-                        Serial1.print(vl53l0x_distance_r);
-                        Serial1.print(",C:");
-                        Serial1.print(vl53l0x_distance_c);
-                        Serial1.print(",L:");
-                        Serial1.print(vl53l0x_distance_l);
-                        Serial1.println("]");
-                        xSemaphoreGive(xSerialSemaphore);
-                    }
-                    #endif
                 }
             }
         }
+
+        // 태스크 실행 종료 신호 (디버깅용)
+        digitalWrite(TOF_TEST_PIN, LOW);
 
         // 정확한 주기 유지
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -1011,16 +1024,22 @@ void TaskIMU(void *pvParameters)
     // Measurement period setting:
     // - IMU data should be read frequently for accurate orientation
     // - 50ms (20Hz) provides good balance between accuracy and performance
-    const TickType_t xFrequency = pdMS_TO_TICKS(50); // 50ms = 20Hz
+    const TickType_t xFrequency = pdMS_TO_TICKS(20); // 50ms = 20Hz
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     for (;;)
     {
-        // WDT reset
-        wdt_reset();
+        // 태스크 실행 시작 신호 (디버깅용)
+        digitalWrite(IMU_TEST_PIN, HIGH);
+
+        // WDT reset (removed - only Camera task resets WDT)
+        // wdt_reset();
 
         // Read IMU data if initialized
         read_IMU_data();
+
+        // 태스크 실행 종료 신호 (디버깅용)
+        digitalWrite(IMU_TEST_PIN, LOW);
 
         // Maintain accurate period
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -1030,6 +1049,6 @@ void TaskIMU(void *pvParameters)
 void loop()
 {
     // mission_flag starts from initial value 0 and changes according to logic in TaskControl
-    Enable_Serial();
+    Disable_Serial();
     vTaskDelay(pdMS_TO_TICKS(10));
 }
