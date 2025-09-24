@@ -49,3 +49,26 @@ Thumbs.db
 .DS_Store?
 ehthumbs.db
 Icon?
+
+# Draw.io files
+*.drawio
+*.drawio.png
+*.drawio.svg
+*.drawio.bkp
+
+# Screenshot files
+Screenshot*.png
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Text editor files
+*.txt
+Untitled*
+
+# Archives
+*.zip
+*.rar
+*.tar.gz
+*.7z
