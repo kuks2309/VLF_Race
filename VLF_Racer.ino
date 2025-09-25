@@ -760,7 +760,7 @@ void TaskCamera(void *pvParameters)
     // pvParameters로 전달받은 threshold 값 추출
     int threshold = *((int *) pvParameters);
 
-    const TickType_t xFrequency = pdMS_TO_TICKS(20); // 20ms = 50Hz
+    const TickType_t xFrequency = pdMS_TO_TICKS(40); // 20ms = 50Hz
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     for (;;)
@@ -855,6 +855,31 @@ void TaskSerial(void *pvParameters)
                 Serial1.print(center_value, 1);
                 Serial1.print(",SA:");
                 Serial1.print(current_steer_angle, 1);
+
+                // TOF sensor values (protected by semaphore)
+                uint16_t tof_r = 0, tof_c = 0, tof_l = 0;
+                if (xSemaphoreTake(xVL53L0XSemaphore, pdMS_TO_TICKS(1)) == pdTRUE) {
+                    tof_r = vl53l0x_distance_r;
+                    tof_c = vl53l0x_distance_c;
+                    tof_l = vl53l0x_distance_l;
+                    xSemaphoreGive(xVL53L0XSemaphore);
+                }
+                Serial1.print(",TOF[R:");
+                Serial1.print(tof_r);
+                Serial1.print(",C:");
+                Serial1.print(tof_c);
+                Serial1.print(",L:");
+                Serial1.print(tof_l);
+
+                // IMU yaw angle (protected by semaphore)
+                float yaw = 0.0;
+                if (xSemaphoreTake(xIMUSemaphore, pdMS_TO_TICKS(1)) == pdTRUE) {
+                    yaw = imu_yaw_filtered;  // Use filtered yaw value
+                    xSemaphoreGive(xIMUSemaphore);
+                }
+                Serial1.print("],Yaw:");
+                Serial1.print(yaw, 1);
+
                 Serial1.print(",MF:");
                 Serial1.print(mission_flag);
                 Serial1.print(",Servo:");
@@ -1049,6 +1074,6 @@ void TaskIMU(void *pvParameters)
 void loop()
 {
     // mission_flag starts from initial value 0 and changes according to logic in TaskControl
-    Disable_Serial();
+    Enable_Serial();
     vTaskDelay(pdMS_TO_TICKS(10));
 }
