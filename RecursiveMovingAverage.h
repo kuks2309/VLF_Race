@@ -24,6 +24,9 @@ class RecursiveMovingAverage
 
     // 현재 윈도우 크기 반환
     int getWindowSize() const;
+
+    // 센서 데이터 배열 읽기
+    void getSensorData(float* data) const;
 };
 
 #endif // RECURSIVE_MOVING_AVERAGE_H

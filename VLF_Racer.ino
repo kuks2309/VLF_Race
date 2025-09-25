@@ -95,11 +95,17 @@ MPU6050_Simple mpu;
 
 // Moving average filter for IMU yaw angle
 RecursiveMovingAverage yawFilter;
+volatile float imu_yaw_filter_avg = 0.0;  // IMU yaw filter average
 
 // Moving average filter for TOF Sensors
 RecursiveMovingAverage tofFilterR;  // Right sensor filter
 RecursiveMovingAverage tofFilterC;  // Center sensor filter
 RecursiveMovingAverage tofFilterL;  // Left sensor filter
+
+// Filter average values (global)
+volatile float tof_filter_avg_r = 0.0;
+volatile float tof_filter_avg_c = 0.0;
+volatile float tof_filter_avg_l = 0.0;
 
 // H value definition (used in calculate_yaw_angle_y_axis function)
 
@@ -118,9 +124,6 @@ volatile uint16_t vl53l0x_raw_r = 0;  // Right sensor raw value
 volatile uint16_t vl53l0x_raw_c = 0;  // Center sensor raw value
 volatile uint16_t vl53l0x_raw_l = 0;  // Left sensor raw value
 volatile bool vl53l0x_initialized = false;  // VL53L0X initialization status
-volatile bool tof_filter_r_init = false;  // Right filter initialization flag
-volatile bool tof_filter_c_init = false;  // Center filter initialization flag
-volatile bool tof_filter_l_init = false;  // Left filter initialization flag
 
 // IMU sensor variables
 volatile float imu_roll = 0.0;   // Left-right tilt (degrees)
@@ -509,8 +512,9 @@ void read_IMU_data()
                 //imu_pitch = mpu.getPitch();
                 imu_yaw = mpu.getYaw();
 
-                // Apply moving average filter to yaw angle
-                imu_yaw_filtered = yawFilter.update(imu_yaw, imu_yaw_filtered);
+                // Apply moving average filter to yaw angle with proper method
+                imu_yaw_filter_avg = yawFilter.update(imu_yaw, imu_yaw_filter_avg);
+                imu_yaw_filtered = imu_yaw_filter_avg;
 
                 xSemaphoreGive(xIMUSemaphore);
             }
@@ -690,6 +694,25 @@ void setup()
 
     // 엔코더 초기화
     interrupt_setup();
+
+    // TOF 필터 및 변수 초기화
+    tofFilterR.reset();
+    tofFilterC.reset();
+    tofFilterL.reset();
+
+    // 필터된 값들 명시적으로 0으로 초기화
+    vl53l0x_distance_r = 0;
+    vl53l0x_distance_c = 0;
+    vl53l0x_distance_l = 0;
+
+    // 필터 평균값들도 초기화
+    tof_filter_avg_r = 0.0;
+    tof_filter_avg_c = 0.0;
+    tof_filter_avg_l = 0.0;
+    imu_yaw_filter_avg = 0.0;
+
+    Serial1.println("TOF filters and variables initialized");
+    Serial1.flush();
 
 #if FASTADC && defined(__AVR__) && defined(ADCSRA)
     // AVR 아키텍처에서만 ADC 속도 최적화 (Arduino Uno, Nano, Mega 등)
@@ -908,7 +931,9 @@ void TaskSerial(void *pvParameters)
                 Serial1.print(",MF:");
                 Serial1.print(mission_flag);
                 Serial1.print(",Servo:");
-                Serial1.println(STRAIGHT_ANGLE + current_steer_angle);
+                Serial1.print(STRAIGHT_ANGLE + current_steer_angle);
+                Serial1.print(",Enc:");
+                Serial1.println(encoderPos);
                 
                 xSemaphoreGive(xSerialSemaphore);
             }
@@ -1034,76 +1059,67 @@ void TaskVL53L0X(void *pvParameters)
             // Protect I2C bus access
             if (xSemaphoreTake(xI2CSemaphore, pdMS_TO_TICKS(5)) == pdTRUE) 
             {
-                // Read distance from each sensor (mm unit)
+                // Read all three TOF sensors
                 uint16_t dist_r = sensorR.readRangeContinuousMillimeters();
                 uint16_t dist_c = sensorC.readRangeContinuousMillimeters();
                 uint16_t dist_l = sensorL.readRangeContinuousMillimeters();
 
                 xSemaphoreGive(xI2CSemaphore);
 
-                // Check for timeout errors (65535 = 0xFFFF = timeout/error)
-                bool timeout_r = sensorR.timeoutOccurred();
-                bool timeout_c = sensorC.timeoutOccurred();
-                bool timeout_l = sensorL.timeoutOccurred();
-
                 // Protect distance values with semaphore
                 if (xSemaphoreTake(xVL53L0XSemaphore, pdMS_TO_TICKS(5)) == pdTRUE)
                 {
-                    // Store raw values (before validation)
+                    // Store raw values
                     vl53l0x_raw_r = dist_r;
                     vl53l0x_raw_c = dist_c;
                     vl53l0x_raw_l = dist_l;
 
-                    // Valid range check (20mm ~ 2000mm) and timeout check
-                    // If timeout or error, don't update filter (keep previous value)
-                    if (!timeout_r && dist_r < 8190 && dist_r >= 20 && dist_r <= 2000) {
-                        if (!tof_filter_r_init) {
-                            // Initialize filter with first valid reading
-                            vl53l0x_distance_r = dist_r;
-                            tofFilterR.reset();
-                            for (int i = 0; i < tofFilterR.getWindowSize(); i++) {
-                                tofFilterR.update(dist_r, dist_r);
-                            }
-                            tof_filter_r_init = true;
-                        } else {
-                            float filtered_r = tofFilterR.update(dist_r, vl53l0x_distance_r);
-                            if (filtered_r >= 0 && filtered_r <= 65535) {
-                                vl53l0x_distance_r = (uint16_t)filtered_r;
-                            }
-                        }
+                    // Apply filter to all sensors with proper method
+                    if (dist_r >= 20 && dist_r <= 2000) 
+                    {
+                        tof_filter_avg_r = tofFilterR.update((float)dist_r, tof_filter_avg_r);
+                        vl53l0x_distance_r = (uint16_t)tof_filter_avg_r;
+                    } 
+                    else 
+                    {
+                        vl53l0x_distance_r = dist_r;
                     }
-                    if (!timeout_c && dist_c < 8190 && dist_c >= 20 && dist_c <= 2000) {
-                        if (!tof_filter_c_init) {
-                            // Initialize filter with first valid reading
-                            vl53l0x_distance_c = dist_c;
-                            tofFilterC.reset();
-                            for (int i = 0; i < tofFilterC.getWindowSize(); i++) {
-                                tofFilterC.update(dist_c, dist_c);
-                            }
-                            tof_filter_c_init = true;
-                        } else {
-                            float filtered_c = tofFilterC.update(dist_c, vl53l0x_distance_c);
-                            if (filtered_c >= 0 && filtered_c <= 65535) {
-                                vl53l0x_distance_c = (uint16_t)filtered_c;
-                            }
-                        }
+
+                    if (dist_c >= 20 && dist_c <= 2000) {
+                        tof_filter_avg_c = tofFilterC.update((float)dist_c, tof_filter_avg_c);
+                        vl53l0x_distance_c = (uint16_t)tof_filter_avg_c;
+                    } else {
+                        vl53l0x_distance_c = dist_c;
                     }
-                    if (!timeout_l && dist_l < 8190 && dist_l >= 20 && dist_l <= 2000) {
-                        if (!tof_filter_l_init) {
-                            // Initialize filter with first valid reading
-                            vl53l0x_distance_l = dist_l;
-                            tofFilterL.reset();
-                            for (int i = 0; i < tofFilterL.getWindowSize(); i++) {
-                                tofFilterL.update(dist_l, dist_l);
-                            }
-                            tof_filter_l_init = true;
-                        } else {
-                            float filtered_l = tofFilterL.update(dist_l, vl53l0x_distance_l);
-                            if (filtered_l >= 0 && filtered_l <= 65535) {
-                                vl53l0x_distance_l = (uint16_t)filtered_l;
-                            }
-                        }
+
+                    if (dist_l >= 20 && dist_l <= 2000) {
+                        tof_filter_avg_l = tofFilterL.update((float)dist_l, tof_filter_avg_l);
+                        vl53l0x_distance_l = (uint16_t)tof_filter_avg_l;
+                    } else {
+                        vl53l0x_distance_l = dist_l;
                     }
+
+                    /*  // Debug output (commented out)
+                    static int debug_count = 0;
+                    if (debug_count % 20 == 0) {
+                        float filterArray[5];
+                        tofFilterR.getSensorData(filterArray);
+                        Serial1.print("FILTER_ARRAY[");
+                        for (int i = 0; i < 5; i++) {
+                            Serial1.print(filterArray[i]);
+                            if (i < 4) Serial1.print(",");
+                        }
+                        Serial1.print("] RAW:");
+                        Serial1.print(dist_r);
+                        Serial1.print(" AVG:");
+                        Serial1.print(tof_filter_avg_r);
+                        Serial1.print(" FLT:");
+                        Serial1.println(vl53l0x_distance_r);
+                        Serial1.flush();
+                    }
+                    debug_count++;
+                    */
+
                     xSemaphoreGive(xVL53L0XSemaphore);
                 }
             }
@@ -1147,9 +1163,16 @@ void TaskIMU(void *pvParameters)
     }
 }
 
+// Test variables for filter simulation
+RecursiveMovingAverage testFilter;
+uint16_t test_raw_values[] = {100, 150, 200, 250, 300, 350, 400, 450, 500, 8190, 8191, 50, 75, 125};
+int test_index = 0;
+float test_filtered = 0.0;
+
 void loop()
 {
-    // mission_flag starts from initial value 0 and changes according to logic in TaskControl
+    // Re-enable tasks with properly initialized filters
     Enable_Serial();
+    Enable_VL53L0X();
     vTaskDelay(pdMS_TO_TICKS(10));
 }
